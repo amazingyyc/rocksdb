@@ -30,7 +30,10 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <unordered_map>
+#include <unordered_map> 
+#include <iostream>
+#include <chrono>
+#include <fstream>
 
 #include "db/db_impl.h"
 #include "db/version_set.h"
@@ -616,13 +619,9 @@ static bool ValidateInt32Percent(const char* flagname, int32_t value) {
 }
 
 /**define some flags for nni to tune*/
-DEFINE_string(nni_input_db_path, "", "the real db data path, include the real data of webdata");
+DEFINE_string(nni_input_ops_path, "", "the real db data path, include the real data of webdata");
 
 DEFINE_string(nni_statistic_output_path, "", "the statistic file output path");
-
-DEFINE_int32(nni_read_write_percent, 50, "the read percent, 50 means 50% is read");
-
-DEFINE_int32(nni_read_hit_percent, 30, "the read hit percent, 30 means 30% is read hit the key in db");
 
 DEFINE_int32(readwritepercent, 90,
              "Ratio of reads to reads/writes (expressed"
@@ -1156,6 +1155,79 @@ struct ReportFileOpCounters {
     std::atomic<int> append_counter_;
     std::atomic<uint64_t> bytes_read_;
     std::atomic<uint64_t> bytes_written_;
+};
+
+/**create a timer record class to record the time, include write time and read time*/
+class NNITimerRecord {
+public:
+    long long last_write_time;
+    long long last_read_time;
+
+    std::vector<long long> write_timer;
+    std::vector<long long> read_timer;
+
+public:
+
+    void begin_write() {
+        last_write_time = this->getCurrentTimeMilliseconds();
+    }
+
+    void end_write() {
+        auto interval = this->getCurrentTimeMilliseconds() - last_write_time;
+
+        write_timer.emplace_back(interval);
+    }
+    
+    void begin_read() {
+        last_read_time = this->getCurrentTimeMilliseconds();
+    }
+    
+    void end_read() {
+        auto interval = this->getCurrentTimeMilliseconds() - last_read_time;
+
+        read_timer.emplace_back(interval);
+    }
+
+    long long getCurrentTimeMilliseconds() {
+        auto time_now = std::chrono::system_clock::now();
+        auto duration_in_ms = std::chrono::duration_cast<std::chrono::milliseconds>(time_now.time_since_epoch());
+        return duration_in_ms.count();
+    }
+};
+
+/**the different opps*/
+struct NNIOp {
+    /**0: write, 1: read*/
+    int type;
+
+    std::string key;
+    std::string value;
+
+    std::string convertHexToStr(std::string hex) {
+        if (hex.length() <= 2 || 0 != (hex.length() % 2)) {
+            return "";
+        }
+
+        std::string str;
+
+        for (int i = 2; i < hex.length(); i += 2) {
+            std::string byte = hex.substr(i, 2);
+
+            char chr = (char)(int)strtol(byte.c_str(), NULL, 16);
+
+            str.push_back(chr);
+        }
+
+        return str;
+    }
+
+    void putHexKey(std::string hex) {
+        this->key = this->convertHexToStr(hex);
+    }
+
+    void putHexValue(std::string hex) {
+        this->value = this->convertHexToStr(hex);
+    }
 };
 
 // A special Env to records and report file operations in db_bench
@@ -2738,25 +2810,15 @@ public:
                  * at here use add a method to tune the RocksDB use nni
                  * in nni we will read a real db data before run test and build special write and read operation to test in RocksDB
                  */
-                fprintf(stdout, "use the nni to tune the RocksDB");
+                fprintf(stdout, "use the nni to tune the RocksDB\n");
 
-                if (FLAGS_nni_input_db_path.empty()) {
-                    fprintf(stderr, "the nni_input_db_path cannot be empty\n");
+                if (FLAGS_nni_input_ops_path.empty()) {
+                    fprintf(stderr, "the nni_input_ops_path cannot be empty\n");
                     exit(1);
                 }
 
                 if (FLAGS_nni_statistic_output_path.empty()) {
                     fprintf(stderr, "the nni_statistic_output_path cannot be empty\n");
-                    exit(1);
-                }
-
-                if (FLAGS_nni_read_write_percent < 0 || FLAGS_nni_read_write_percent > 100) {
-                    fprintf(stderr, "the nni_read_write_percent must be in [0, 100]\n");
-                    exit(1);
-                }
-
-                if (FLAGS_nni_read_hit_percent < 0 || FLAGS_nni_read_hit_percent > 100) {
-                    fprintf(stderr, "the nni_read_hit_percent must be in [0, 100]\n");
                     exit(1);
                 }
 
@@ -3001,40 +3063,78 @@ private:
         if (ptr == nullptr) exit(1);  // Disable unused variable warning.
     }
 
-
     /**at here add a function to do the nni tune*/
     void NNI(ThreadState* thread) {
-        fprintf(stdout, "start to run test for NNI");
+        fprintf(stdout, "start to run test for NNI\n");
 
         /**step1: check the flags*/
-        fprintf(stdout, "step1: read FLAGS");
+        fprintf(stdout, "step1: read FLAGS\n");
 
-        std::string input_db_path         = FLAGS_nni_input_db_path;
-        std::string statistic_output_path = FLAGS_nni_statistic_output_path;
-        int32_t read_write_percent    = FLAGS_nni_read_write_percent;
-        int32_t read_hit_percent      = FLAGS_nni_read_hit_percent;
+        /**step2: read the ops to memory*/
+        fprintf(stdout, "step2: read the input ops to memory\n");
 
-        /**step2: read the real data to memory*/
-        fprintf(stdout, "step2: read the input db data to memory");
+        std::vector<NNIOp> all_ops;
 
-        /**store the all input data*/
-        std::vector<std::tuple<rocksdb::Slice, rocksdb::Slice>> all_input_data;
+        std::ifstream ops_stream(FLAGS_nni_input_ops_path.c_str(), std::ios::in);
+        
+        std::string type;
 
-        rocksdb::DB* input_db;
-        rocksdb::Options input_options;
+        while (std::getline(ops_stream, type)) {
+            if ("0" == type) {
+                /**write op*/
+                std::string key;
+                std::string value;
 
-        rocksdb::Status status = rocksdb::DB::Open(input_options, input_db_path, &input_db);
-        assert(status.ok());
+                if (std::getline(ops_stream, key) && std::getline(ops_stream, value)) {
+                    struct NNIOp op;
+                    op.type  = 0;
+                    op.putHexKey(key);
+                    op.putHexValue(value);
 
-        /**read all data to memory*/
-        rocksdb::Iterator* it = input_db->NewIterator(rocksdb::ReadOptions());
-        for (it->SeekToFirst(); it->Valid(); it->Next()) {
-            all_input_data.emplace_back(std::make_tuple(it->key(), it->value()));
+                    if (!op.key.empty() && !op.value.empty()) {
+                        all_ops.emplace_back(op);
+                    }
+                }
+            } else if ("1" == type) {
+                /**read op*/
+                std::string key;
+
+                if (std::getline(ops_stream, key)) {
+                    struct NNIOp op;
+                    op.type = 1;
+                    op.putHexKey(key);
+
+                    if (!op.key.empty()) {
+                        all_ops.emplace_back(op);
+                    }
+                }
+            } else {
+                fprintf(stderr, "the input ops is error!\n");
+            }
         }
 
-        /**step3: random the input data*/
-        fprintf(stdout, "step3: random the input data");
+        ops_stream.close();
 
+        /**step3: follow the input ops to test the db*/
+        fprintf(stdout, "step3: follow the input ops to test the db\n");
+
+        NNITimerRecord timer_record;
+
+        for (auto op : all_ops) {
+            if (0 == op.type) {
+                timer_record.begin_write();
+                
+                /**put value to db*/
+
+                timer_record.end_write();
+            } else if (1 == op.type) {
+                timer_record.begin_read();
+
+                /**get value to db*/
+
+                timer_record.end_read();
+            }
+        }
     }
 
     void Compress(ThreadState* thread) {

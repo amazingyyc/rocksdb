@@ -34,6 +34,7 @@
 #include <iostream>
 #include <chrono>
 #include <fstream>
+#include <queue>
 
 #include "db/db_impl.h"
 #include "db/version_set.h"
@@ -623,6 +624,10 @@ DEFINE_string(nni_input_ops_path, "", "the real db data path, include the real d
 
 DEFINE_string(nni_statistic_output_path, "", "the statistic file output path");
 
+DEFINE_string(nni_column_family, "", "the column family");
+
+DEFINE_bool(nni_debug, true, "debug");
+
 DEFINE_int32(readwritepercent, 90,
              "Ratio of reads to reads/writes (expressed"
              " as percentage) for the ReadRandomWriteRandom workload. The "
@@ -1157,6 +1162,104 @@ struct ReportFileOpCounters {
     std::atomic<uint64_t> bytes_written_;
 };
 
+class NNIBarrier {
+public:
+    std::atomic<int64_t> barrier;
+
+    NNIBarrier(int64_t count) : barrier(count) {
+        if (count <= 0) {
+            throw std::runtime_error("count must be >= 0");
+        }
+    }
+
+    NNIBarrier() : barrier(0) {
+    }
+
+    void add() {
+        barrier++;
+    }
+
+    void notify() {
+        barrier--;
+    }
+
+    void wait() {
+        while (barrier > 0) {}
+    }
+};
+
+/**a simple background thread include a queue and a background thread to do work*/
+class NNIThread {
+public:
+    /**the worker thread*/
+    std::thread worker;
+
+    /**the task queue*/
+    std::queue<std::function<void()>> tasks;
+
+    /**the mutex*/
+    std::mutex mutex;
+
+    /**the condition variable*/
+    std::condition_variable cond_var;
+
+    /**if stop this thread*/
+    std::atomic<bool> stopped;
+
+    NNIThread() : stopped(false) {
+        worker = std::thread(&NNIThread::run, this);
+    }
+
+    void run() {
+        while (!this->stopped) {
+            /**first lock the mutes wait a task*/
+            std::unique_lock<std::mutex> lock(mutex);
+            
+            cond_var.wait(lock, [this] { return this->stopped.load() || !this->tasks.empty(); });
+
+            if (this->stopped) {
+                break;
+            }
+
+            if (this->tasks.empty()) {
+                continue;
+            }
+
+            auto task = std::move(tasks.front());
+            tasks.pop();
+
+            /**unlock to release the mutex*/
+            lock.unlock();
+
+            /**run task*/
+            task();
+        }
+    }
+
+    template <class F, class... Args>
+    void enqueue(F&& f, Args&&... args) {
+        if (stopped) {
+            throw std::runtime_error("the thread has been stoped");
+        }
+
+        auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+
+            tasks.emplace([task]() { task(); });
+        }
+
+        cond_var.notify_one();
+    }
+
+    void stop() {
+        stopped = true;
+        cond_var.notify_all();
+        worker.join();
+    }
+};
+
 /**create a timer record class to record the time, include write time and read time*/
 class NNITimerRecord {
 public:
@@ -1167,7 +1270,6 @@ public:
     std::vector<long long> read_timer;
 
 public:
-
     void begin_write() {
         last_write_time = this->getCurrentTimeMilliseconds();
     }
@@ -1193,24 +1295,55 @@ public:
         auto duration_in_ms = std::chrono::duration_cast<std::chrono::milliseconds>(time_now.time_since_epoch());
         return duration_in_ms.count();
     }
+
+    /**sort the time*/
+    void sort() {
+        std::sort(write_timer.begin(), write_timer.end());
+        std::sort(read_timer.begin(), read_timer.end());
+    }
 };
 
 /**the different opps*/
 struct NNIOp {
-    /**0: write, 1: read*/
+    int threadId;
+
+    /**运行的时间*/
+    int64_t time;
+
+    /**-1: nothing 0: write, 1: delete, 2:read, 3:range read*/
     int type;
 
+    /**
+     * 0: write, the value may be empty
+     * 1: delete only use key
+     * 2: read only need key
+     * 3: range query use start key and query_count iterator
+     */
     std::string key;
     std::string value;
 
-    std::string convertHexToStr(std::string hex) {
-        if (hex.length() <= 2 || 0 != (hex.length() % 2)) {
+    int64_t query_count;
+
+
+    NNIOp(): threadId(0), time(0), type(-1), query_count(2000) {
+    }
+
+    static std::string convertHexToStr(std::string hex, bool has_prefix = false) {
+        if (has_prefix) {
+            if (hex.length() <= 2) {
+                return "";
+            }
+
+            hex = hex.substr(2, hex.length() - 2);
+        }
+
+        if (0 != hex.length() % 2) {
             return "";
         }
 
         std::string str;
 
-        for (int i = 2; i < hex.length(); i += 2) {
+        for (int i = 0; i < hex.length(); i += 2) {
             std::string byte = hex.substr(i, 2);
 
             char chr = (char)(int)strtol(byte.c_str(), NULL, 16);
@@ -1221,13 +1354,32 @@ struct NNIOp {
         return str;
     }
 
-    void putHexKey(std::string hex) {
-        this->key = this->convertHexToStr(hex);
+    static std::vector<std::string> split_str(std::string& str, std::string sep) {
+        std::vector<std::string> ret;
+
+        if (str.empty() || sep.empty()) {
+            return ret;
+        }
+
+        size_t start = 0;
+
+        while (true) {
+            auto pos = str.find(sep, start);
+
+            if (pos == str.npos) {
+                ret.emplace_back(str.substr(start, str.length() - start));
+
+                break;
+            } else {
+                ret.emplace_back(str.substr(start, pos - start));
+            }
+
+            start = pos + sep.length();
+        }
+
+        return ret;
     }
 
-    void putHexValue(std::string hex) {
-        this->value = this->convertHexToStr(hex);
-    }
 };
 
 // A special Env to records and report file operations in db_bench
@@ -1415,6 +1567,7 @@ static void AppendWithSpace(std::string* str, Slice msg) {
 
 struct DBWithColumnFamilies {
     std::vector<ColumnFamilyHandle*> cfh;
+    std::vector<ColumnFamilyHandle*> nni_cfh;
     DB* db;
 #ifndef ROCKSDB_LITE
     OptimisticTransactionDB* opt_txn_db;
@@ -1436,6 +1589,7 @@ struct DBWithColumnFamilies {
 #endif  // ROCKSDB_LITE
     {
         cfh.clear();
+        nni_cfh.clear();
         num_created = 0;
         num_hot = 0;
     }
@@ -1454,7 +1608,12 @@ struct DBWithColumnFamilies {
     void DeleteDBs() {
         std::for_each(cfh.begin(), cfh.end(),
                       [](ColumnFamilyHandle* cfhi) { delete cfhi; });
+
+        std::for_each(nni_cfh.begin(), nni_cfh.end(),
+                      [](ColumnFamilyHandle* cfhi) { delete cfhi; });
+
         cfh.clear();
+        nni_cfh.clear();
 #ifndef ROCKSDB_LITE
         if (opt_txn_db) {
             delete opt_txn_db;
@@ -2822,6 +2981,11 @@ public:
                     exit(1);
                 }
 
+                if (FLAGS_nni_column_family.empty()) {
+                    fprintf(stderr, "the nni_column_family cannot be empty\n");
+                    exit(1);
+                }
+
                 method = &Benchmark::NNI;
             } else if (!name.empty()) {  // No error message for empty name
                 fprintf(stderr, "unknown benchmark '%s'\n", name.c_str());
@@ -3067,74 +3231,285 @@ private:
     void NNI(ThreadState* thread) {
         fprintf(stdout, "start to run test for NNI\n");
 
-        /**step1: check the flags*/
-        fprintf(stdout, "step1: read FLAGS\n");
-
-        /**step2: read the ops to memory*/
-        fprintf(stdout, "step2: read the input ops to memory\n");
+        fprintf(stdout, "step1: read the input ops to memory\n");
 
         std::vector<NNIOp> all_ops;
 
         std::ifstream ops_stream(FLAGS_nni_input_ops_path.c_str(), std::ios::in);
-        
-        std::string type;
 
-        while (std::getline(ops_stream, type)) {
-            if ("0" == type) {
-                /**write op*/
-                std::string key;
-                std::string value;
+        std::string line;
 
-                if (std::getline(ops_stream, key) && std::getline(ops_stream, value)) {
-                    struct NNIOp op;
-                    op.type  = 0;
-                    op.putHexKey(key);
-                    op.putHexValue(value);
+        int max_thread_idx = 0;
 
-                    if (!op.key.empty() && !op.value.empty()) {
-                        all_ops.emplace_back(op);
-                    }
+        while (std::getline(ops_stream, line)) {
+            if (line.empty()) {
+                continue;
+            }
+
+            auto splits = NNIOp::split_str(line, "\t");
+
+            if (splits.empty()) {
+                continue;
+            }
+
+            NNIOp op;
+
+            /**-1: nothing 0: write, 1: delete, 2:read, 3:range read*/
+            if ("W" == splits[0]) {
+                 if (5 == splits.size()) {
+                     op.type     = 0;
+                     op.time     = std::stoll(splits[1]);
+                     op.threadId = std::stoi(splits[2]);
+                     op.key      = NNIOp::convertHexToStr(splits[3]);
+                     op.value    = NNIOp::convertHexToStr(splits[4]);
+
+                 } else if (4 == splits.size()) {
+                     op.type     = 0;
+                     op.time     = std::stoll(splits[1]);
+                     op.threadId = std::stoi(splits[2]);
+                     op.key      = NNIOp::convertHexToStr(splits[3]);
+                     op.value    = "";
+                 }
+            } else if ("D" == splits[0]) {
+                if (4 == splits.size()) {
+                    op.type     = 1;
+                    op.time     = std::stoll(splits[1]);
+                    op.threadId = std::stoi(splits[2]);
+                    op.key      = NNIOp::convertHexToStr(splits[3]);
                 }
-            } else if ("1" == type) {
-                /**read op*/
-                std::string key;
-
-                if (std::getline(ops_stream, key)) {
-                    struct NNIOp op;
-                    op.type = 1;
-                    op.putHexKey(key);
-
-                    if (!op.key.empty()) {
-                        all_ops.emplace_back(op);
-                    }
+            } else if ("R" == splits[0]) {
+                if (4 == splits.size()) {
+                    op.type     = 2;
+                    op.time     = std::stoll(splits[1]);
+                    op.threadId = std::stoi(splits[2]);
+                    op.key      = NNIOp::convertHexToStr(splits[3]);
+                }
+            } else if ("RR" == splits[0]) {
+                if (4 == splits.size()) {
+                    op.type     = 3;
+                    op.time     = std::stoll(splits[1]);
+                    op.threadId = std::stoi(splits[2]);
+                    op.key      = NNIOp::convertHexToStr(splits[3]);
                 }
             } else {
-                fprintf(stderr, "the input ops is error!\n");
+                continue;
+            }
+
+            if (!op.key.empty()) {
+                all_ops.emplace_back(op);
+
+                max_thread_idx = std::max<int>(max_thread_idx, op.threadId);
+
+                if (FLAGS_nni_debug) {
+                    std::cout << "ops type:" << op.type << ",threadId:" << op.threadId << ",time:" << op.time << ", key:" << op.key << std::endl;
+                }
             }
         }
-
+        
         ops_stream.close();
 
-        /**step3: follow the input ops to test the db*/
-        fprintf(stdout, "step3: follow the input ops to test the db\n");
+        if (all_ops.empty()) {
+            std::cout << "the ops is empty" << std::endl;
+            exit(1);
+        }
 
-        NNITimerRecord timer_record;
+        /**start push the op to different thread*/
+        max_thread_idx++;
 
-        for (auto op : all_ops) {
-            if (0 == op.type) {
-                timer_record.begin_write();
-                
-                /**put value to db*/
+        /**create read and write option and get db*/
+        auto db = db_.db;
 
-                timer_record.end_write();
-            } else if (1 == op.type) {
-                timer_record.begin_read();
+        if (nullptr == db) {
+            std::cout << "the db is null" << std::endl;
+            exit(1);
+        }
 
-                /**get value to db*/
+        /**get column family by name*/
+        ColumnFamilyHandle *cfh = nullptr;
 
-                timer_record.end_read();
+        for (auto i : db_.nni_cfh) {
+            if (FLAGS_nni_column_family == i->GetName()) {
+                cfh = i;
+                break;
             }
         }
+
+        if (nullptr == cfh) {
+            std::cout << "the FLAGS_nni_column_family is error" << std::endl;
+            exit(1);
+        }
+
+        /**create threads pool and timer record*/
+        std::vector<NNIThread> bg_threads(max_thread_idx);
+        std::vector<NNITimerRecord> timer_record(max_thread_idx);
+
+        /**create read and wirte options*/
+        ReadOptions read_options(FLAGS_verify_checksum, true);
+        WriteOptions write_options = write_options_;
+
+        NNIBarrier barrier;
+
+        fprintf(stdout, "step2: do ops\n");
+
+        int64_t start_time = all_ops[0].time;
+
+        for (size_t i = 0; i < all_ops.size(); ) {
+            auto op = all_ops[i];
+
+            if (op.time > start_time) {
+                /**sleep*/
+                auto sleep_time = op.time - start_time;
+                sleep_time      = std::min<int64_t>(sleep_time, 10);
+
+                start_time = op.time;
+
+                if (FLAGS_nni_debug) {
+                    std::cout << "sleep " << sleep_time << "ms" << std::endl;
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
+
+                continue;
+            }
+
+            auto thread_id = op.threadId;
+
+            if (0 == op.type || 1 == op.type) {
+                /**write*/
+                if (FLAGS_nni_debug) {
+                    std::cout << "add a write key: " << op.key << std::endl;
+                }
+
+                barrier.add();
+
+                bg_threads[thread_id].enqueue([db, cfh, write_options, &op, &timer_record, thread_id, &barrier]() {
+                    timer_record[thread_id].begin_write();
+
+                    db->Put(write_options, cfh, Slice(op.key), Slice(op.value));
+
+                    timer_record[thread_id].end_write();
+
+                    barrier.notify();
+                });
+            } else if (2 == op.type) {
+                /**delete*/
+                if (FLAGS_nni_debug) {
+                    std::cout << "add a delete key: " << op.key << std::endl;
+                }
+
+                barrier.add();
+
+                bg_threads[thread_id].enqueue([db, cfh, write_options, &op, &timer_record, thread_id, &barrier]() {
+                    timer_record[thread_id].begin_write();
+
+                    db->Delete(write_options, cfh, Slice(op.key));
+
+                    timer_record[thread_id].end_write();
+
+                    barrier.notify();
+                 });
+            } else if (3 == op.type) {
+                /**read*/
+                if (FLAGS_nni_debug) {
+                    std::cout << "add a read key:" << op.key << std::endl;
+                }
+
+                barrier.add();
+
+                bg_threads[thread_id].enqueue([db, cfh, read_options, &op, &timer_record, thread_id, &barrier]() {
+                    timer_record[thread_id].begin_read();
+
+                    db->Get(read_options, cfh, Slice(op.key), &op.value);
+
+                    timer_record[thread_id].end_read();
+
+                    barrier.notify();
+                });
+            } else if (4 == op.type) {
+                /**batch read*/
+                if (FLAGS_nni_debug) {
+                    std::cout << "add a range read start key:" << op.key << std::endl;
+                }
+
+                barrier.add();
+
+                bg_threads[thread_id].enqueue([db, cfh, read_options, &op, &timer_record, thread_id, &barrier]() {
+                    rocksdb::Iterator* it = db->NewIterator(read_options, cfh);
+
+                    int i = 0;
+                    it->Seek(Slice(op.key));
+
+                    while (it->Valid() && i < 2000) {
+                        timer_record[thread_id].begin_read();
+
+                        it->Next();
+                        i++;
+
+                        timer_record[thread_id].end_read();
+                    }
+
+                    delete it;
+
+                    barrier.notify();
+                });
+            }
+
+            i++;
+        }
+
+        if (FLAGS_nni_debug) {
+            std::cout << "wait threads finish" << std::endl;
+        }
+
+        barrier.wait();
+
+        for (int i = 0; i < max_thread_idx; ++i) {
+            bg_threads[i].stop();
+        }
+
+        fprintf(stdout, "step3: merge reault and write it to file\n");
+
+        /**merge result*/
+        std::vector<long long> write_timer;
+        std::vector<long long> read_timer;
+
+        size_t total_count = 0;
+
+        for (auto item : timer_record) {
+            write_timer.insert(write_timer.end(), item.write_timer.begin(), item.write_timer.end());
+            read_timer.insert(read_timer.end(), item.read_timer.begin(), item.read_timer.end());
+
+            total_count += item.write_timer.size();
+            total_count += item.read_timer.size();
+        }
+
+        int64_t write_ops_count = write_timer.size();
+        int64_t read_ops_count  = read_timer.size();
+        
+        float percentile[5] = {0.50f, 0.99f, 0.999f, 0.9999f, 0.99999f};
+        int title[5] = {50, 99, 999, 9999, 99999};
+        
+        std::ofstream output_stream(FLAGS_nni_statistic_output_path.c_str(), std::ios::out);
+
+        for (int i = 0; i < 5; ++i) {
+            auto write_index = (int64_t)(float(write_ops_count) * percentile[i]);
+            auto read_index  = (int64_t)(float(read_ops_count)  * percentile[i]);
+
+            std::cout << "write_index:" << write_index << std::endl;
+            std::cout << "read_index:"  << read_index << std::endl;
+        
+            if (0 <= write_index && write_index < write_ops_count) {
+                output_stream << "write" << title[i] << ":" << write_timer[write_index] << "\n";
+            }
+        
+            if (0 <= read_index && read_index < read_ops_count) {
+                output_stream << "read" << title[i] << ":" << read_timer[read_index] << "\n";
+            }
+        }
+        
+        output_stream.close();
+
+        fprintf(stdout, "done!\n");
     }
 
     void Compress(ThreadState* thread) {
@@ -3805,7 +4180,28 @@ private:
             }
 #endif  // ROCKSDB_LITE
         } else {
-            s = DB::Open(options, db_name, &db->db);
+            if (FLAGS_benchmarks.find("nni") != FLAGS_benchmarks.npos) {
+                /**change to open with column family*/
+                std::cout << "specific for nni" << std::endl;
+
+                DBOptions db_options(options);
+                ColumnFamilyOptions cf_options(options);
+
+                std::vector<ColumnFamilyDescriptor> column_families = {
+                    {kDefaultColumnFamilyName, cf_options},
+                    {"ContentDataCG", cf_options},
+                    {"CrawlMetaCG", cf_options},
+                    {"IndexDataCG", cf_options},
+                    {"ProcessMetaCG", cf_options},
+                    {"UpdateDeltaCG", cf_options}
+                };
+                
+                s = DB::Open(db_options, db_name, column_families, &db->nni_cfh, &db->db);
+            } else {
+                s = DB::Open(options, db_name, &db->db);
+            }
+
+
         }
         if (!s.ok()) {
             fprintf(stderr, "open error: %s\n", s.ToString().c_str());
